@@ -36,7 +36,9 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import unquote
 
-# Try importing textual for TUI mode
+# Try importing textual for TUI mode — catch *any* error (not just
+# ImportError) because textual may segfault or be incompatible with
+# newer Python versions (e.g. 3.14).
 HAS_TEXTUAL = False
 try:
     from textual.app import App, ComposeResult
@@ -46,7 +48,7 @@ try:
     from textual.reactive import reactive
     from textual import work
     HAS_TEXTUAL = True
-except ImportError:
+except Exception:
     pass
 
 
@@ -56,6 +58,11 @@ def _ensure_textual() -> bool:
     global HAS_TEXTUAL
     if HAS_TEXTUAL:
         return True
+    # Guard against infinite re-exec if pip installs to wrong location
+    if os.environ.get("_DB_TUNNEL_TEXTUAL_ATTEMPTED"):
+        print("textual could not be loaded after install — falling back to text mode.")
+        print("  Try: pip install textual   (or use --no-tui)")
+        return False
     try:
         ans = input("textual is not installed (needed for TUI mode). Install now? [Y/n] ").strip()
     except (EOFError, KeyboardInterrupt):
@@ -70,6 +77,7 @@ def _ensure_textual() -> bool:
         return False
     # Re-exec so the 'if HAS_TEXTUAL:' block defines all TUI classes
     print("Restarting with textual...")
+    os.environ["_DB_TUNNEL_TEXTUAL_ATTEMPTED"] = "1"
     os.execv(sys.executable, [sys.executable] + sys.argv)
     return False  # unreachable
 
