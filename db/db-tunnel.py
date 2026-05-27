@@ -36,9 +36,7 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import unquote
 
-# Try importing textual for TUI mode — catch *any* error (not just
-# ImportError) because textual may segfault or be incompatible with
-# newer Python versions (e.g. 3.14).
+# Try importing textual for TUI mode
 HAS_TEXTUAL = False
 try:
     from textual.app import App, ComposeResult
@@ -71,15 +69,19 @@ def _ensure_textual() -> bool:
         return False
     print("Installing textual...")
     try:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "textual"])
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "--quiet",
+             "--user", "--break-system-packages", "textual"]
+        )
     except subprocess.CalledProcessError:
-        print(f"Failed to install textual. Use --no-tui for text mode.")
+        print("Failed to install textual. Use --no-tui for text mode.")
         return False
     # Re-exec so the 'if HAS_TEXTUAL:' block defines all TUI classes
     print("Restarting with textual...")
     os.environ["_DB_TUNNEL_TEXTUAL_ATTEMPTED"] = "1"
     os.execv(sys.executable, [sys.executable] + sys.argv)
     return False  # unreachable
+
 
 # ── Colours / symbols ──────────────────────────────────────────────
 RED = "\033[0;31m"
@@ -94,7 +96,7 @@ WARN = f"{YELLOW}⚠{NC}"
 ERR = f"{RED}✖{NC}"
 
 # ═══════════════════════════════════════════════════════════════════
-# SERVICE MAP — add new entries here
+# SERVICE MAP
 # ═══════════════════════════════════════════════════════════════════
 @dataclass
 class ServiceDef:
@@ -116,7 +118,8 @@ SERVICES: list[ServiceDef] = [
 
 SERVICE_MAP = {s.name: s for s in SERVICES}
 
-POD_NAME = "psql-client"
+_user = os.environ.get("USER", "default").lower().replace(" ", "-")
+POD_NAME = f"psql-client-{_user}"
 POD_NS = os.environ.get("POD_NS", "default")
 POD_IMAGE = "postgres:16-alpine"
 
@@ -139,8 +142,8 @@ def kubectl(*args: str, capture=True, check=True, timeout=60) -> subprocess.Comp
     return run(["kubectl", *args], capture=capture, check=check, timeout=timeout)
 
 
-def kubectl_exec(cmd: str, *, pod=POD_NAME, ns=POD_NS) -> subprocess.CompletedProcess:
-    return kubectl("exec", pod, "-n", ns, "--", "sh", "-c", cmd, check=False)
+def kubectl_exec(cmd: str, *, pod=POD_NAME, ns=POD_NS, timeout=60) -> subprocess.CompletedProcess:
+    return kubectl("exec", pod, "-n", ns, "--", "sh", "-c", cmd, check=False, timeout=timeout)
 
 
 @dataclass
@@ -384,14 +387,13 @@ def cleanup() -> None:
 atexit.register(cleanup)
 
 
-def _install_signal_handlers() -> None:
-    """Install signal handlers for non-TUI mode only.
-    Textual manages its own signals; ours would kill the TUI."""
-    def handle_signal(signum, frame):
-        cleanup()
-        sys.exit(0)
-    signal.signal(signal.SIGINT, handle_signal)
-    signal.signal(signal.SIGTERM, handle_signal)
+def handle_signal(signum, frame):
+    cleanup()
+    sys.exit(0)
+
+
+signal.signal(signal.SIGINT, handle_signal)
+signal.signal(signal.SIGTERM, handle_signal)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -411,28 +413,41 @@ def start_tunnel(t: Tunnel, idx: int) -> None:
     rport = t.svc.relay_port
     lport = t.svc.local_port
 
-    # Ensure pod is alive (may have been deleted/restarted)
-    ensure_pod()
-    install_socat()
-
-    # Kill stale socat
-    kubectl_exec(f"pkill -f 'TCP-LISTEN:{rport}' 2>/dev/null; true")
+    # Kill stale socat (short timeout — pkill can hang if forked children hold fds)
+    try:
+        kubectl_exec(f"pkill -f 'TCP-LISTEN:{rport}' 2>/dev/null; true", timeout=10)
+    except subprocess.TimeoutExpired:
+        pass  # stale socat children held fds open — proceed anyway
 
     # Start socat relay (log errors to /tmp/socat-<port>.log)
     socat_log = f"/tmp/socat-{rport}.log"
-    kubectl_exec(f"rm -f {socat_log}")
-    kubectl_exec(
-        f"nohup socat TCP-LISTEN:{rport},fork,reuseaddr "
-        f"TCP:{t.info.host}:{t.info.port} >/dev/null 2>{socat_log} &"
-    )
+    try:
+        kubectl_exec(f"rm -f {socat_log}", timeout=10)
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        kubectl_exec(
+            f"nohup socat TCP-LISTEN:{rport},fork,reuseaddr "
+            f"TCP:{t.info.host}:{t.info.port} </dev/null >/dev/null 2>{socat_log} &",
+            timeout=10,
+        )
+    except subprocess.TimeoutExpired:
+        pass  # Expected — backgrounded socat keeps kubectl exec open
     time.sleep(1)
 
     # Check socat started successfully
-    r = kubectl_exec(f"pgrep -f 'TCP-LISTEN:{rport}' >/dev/null 2>&1")
-    if r.returncode != 0:
+    try:
+        r = kubectl_exec(f"pgrep -f 'TCP-LISTEN:{rport}' >/dev/null 2>&1", timeout=10)
+    except subprocess.TimeoutExpired:
+        print(f"{WARN} Timeout checking socat for {GREEN}{t.svc.name}{NC} — assuming started")
+        r = None
+    if r is not None and r.returncode != 0:
         # socat failed to start — show the error
-        err_r = kubectl_exec(f"cat {socat_log} 2>/dev/null")
-        err_msg = err_r.stdout.strip() if err_r.stdout else "unknown error"
+        try:
+            err_r = kubectl_exec(f"cat {socat_log} 2>/dev/null", timeout=10)
+            err_msg = err_r.stdout.strip() if err_r.stdout else "unknown error"
+        except subprocess.TimeoutExpired:
+            err_msg = "unknown error (timeout reading log)"
         print(f"{ERR} socat failed to start for {GREEN}{t.svc.name}{NC}: {RED}{err_msg}{NC}")
         print(f"{WARN} Check host/port: {CYAN}{t.info.host}:{t.info.port}{NC}")
         t.status = "disconnected"
@@ -443,9 +458,7 @@ def start_tunnel(t: Tunnel, idx: int) -> None:
 
     # Start port-forward in background, capture stderr for error monitoring
     pf_log_path = f"/tmp/pf-{lport}.log"
-    # Truncate old log to avoid stale error alerts
-    open(pf_log_path, "w").close()
-    pf_log_fh = open(pf_log_path, "a")
+    pf_log_fh = open(pf_log_path, "w")
     proc = subprocess.Popen(
         ["kubectl", "port-forward", f"pod/{POD_NAME}",
          f"{lport}:{rport}", "-n", POD_NS],
@@ -464,8 +477,11 @@ def check_tunnel_health(t: Tunnel, idx: int) -> bool:
     socat_log = f"/tmp/socat-{rport}.log"
 
     # 1. Check socat log for relay-level errors
-    r = kubectl_exec(f"cat {socat_log} 2>/dev/null")
-    log_content = r.stdout.strip() if r.stdout else ""
+    try:
+        r = kubectl_exec(f"cat {socat_log} 2>/dev/null", timeout=10)
+        log_content = r.stdout.strip() if r.stdout else ""
+    except subprocess.TimeoutExpired:
+        log_content = ""
 
     if log_content:
         error_patterns = [
@@ -491,11 +507,16 @@ def check_tunnel_health(t: Tunnel, idx: int) -> bool:
     raw_pass = unquote(t.info.password)
     # Base64-encode password to pass safely through shell
     pass_b64 = base64.b64encode(raw_pass.encode()).decode()
-    probe = kubectl_exec(
-        f"PGPASSWORD=$(echo '{pass_b64}' | base64 -d) "
-        f"psql -h 127.0.0.1 -p {rport} -U {shlex.quote(t.info.user)} "
-        f"-d {shlex.quote(t.info.dbname)} -c 'SELECT 1' 2>&1 | head -5"
-    )
+    try:
+        probe = kubectl_exec(
+            f"PGPASSWORD=$(echo '{pass_b64}' | base64 -d) "
+            f"psql -h 127.0.0.1 -p {rport} -U {shlex.quote(t.info.user)} "
+            f"-d {shlex.quote(t.info.dbname)} -c 'SELECT 1' 2>&1 | head -5",
+            timeout=15,
+        )
+    except subprocess.TimeoutExpired:
+        print(f"\n{WARN} Health check timed out for {GREEN}{t.svc.name}{NC}")
+        return False
     probe_out = probe.stdout.strip() if probe.stdout else ""
 
     if probe.returncode != 0 or "FATAL" in probe_out or "error" in probe_out.lower():
@@ -548,7 +569,10 @@ def stop_tunnel(t: Tunnel, idx: int) -> None:
         t.pf_proc = None
         pf_processes.pop(idx, None)
 
-    kubectl_exec(f"pkill -f 'TCP-LISTEN:{t.svc.relay_port}' 2>/dev/null; true")
+    try:
+        kubectl_exec(f"pkill -f 'TCP-LISTEN:{t.svc.relay_port}' 2>/dev/null; true", timeout=10)
+    except subprocess.TimeoutExpired:
+        pass  # stale socat children held fds open
     t.status = "disconnected"
 
 
@@ -592,12 +616,12 @@ def print_pgadmin_details(tunnels: list[Tunnel]) -> None:
     print(f"\n  {CYAN}pgAdmin connection details:{NC}")
     for t in tunnels:
         print(f"\n  {GREEN}{t.svc.name}{NC}:")
-        print(f"    Host:     {GREEN}localhost{NC}")
-        print(f"    Port:     {GREEN}{t.svc.local_port}{NC}")
+        print(f"    Host:     {GREEN}localhost:{t.svc.local_port}{NC}")
         print(f"    Database: {GREEN}{t.info.dbname}{NC}")
         print(f"    Username: {GREEN}{t.info.user}{NC}  {YELLOW}← update in pgAdmin if this changes{NC}")
         print(f"    Password: {YELLOW}leave empty{NC} — auto-read from {CYAN}~/.pgpass{NC}")
-        print(f"    Parameters → Password file: {GREEN}/Users/{user}/.pgpass{NC}")
+        print(f"    Passfile: {GREEN}/Users/{user}/.pgpass{NC}")
+        print(f"    Remote:   {CYAN}{t.info.host}:{t.info.port}{NC}")
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -616,13 +640,17 @@ if HAS_TEXTUAL:
         CSS = """
         #sel-header {
             height: auto;
-            padding: 1 3;
+            padding: 1 2;
             background: $boost;
             margin-bottom: 1;
+            width: 100%;
+            border: round cyan;
+            text-style: bold;
         }
         #sel-list {
-            height: auto;
+            height: 1fr;
             padding: 0 3;
+            overflow-y: auto;
         }
         """
 
@@ -632,6 +660,16 @@ if HAS_TEXTUAL:
             Binding("3", "toggle_3", show=False, priority=True),
             Binding("4", "toggle_4", show=False, priority=True),
             Binding("5", "toggle_5", show=False, priority=True),
+            Binding("6", "toggle_6", show=False, priority=True),
+            Binding("7", "toggle_7", show=False, priority=True),
+            Binding("8", "toggle_8", show=False, priority=True),
+            Binding("9", "toggle_9", show=False, priority=True),
+            Binding("0", "toggle_0", show=False, priority=True),
+            Binding("up", "cursor_up", show=False, priority=True),
+            Binding("down", "cursor_down", show=False, priority=True),
+            Binding("space", "toggle_cursor", "Toggle (space)", show=False, priority=True),
+            Binding("a", "select_all", "All (a)", show=True, priority=True),
+            Binding("n", "select_none", "None (n)", show=True, priority=True),
             Binding("f", "forward", "Forward (f)", show=True, priority=True),
             Binding("c", "console", "psql (c)", show=True, priority=True),
             Binding("ctrl+q", "quit_app", "Quit (^Q)", show=True),
@@ -640,14 +678,12 @@ if HAS_TEXTUAL:
         def __init__(self, **kwargs):
             super().__init__(**kwargs)
             self._selected: set[str] = set()
+            self._cursor: int = 0
 
         def compose(self) -> ComposeResult:
             yield Header(show_clock=True)
             yield Static(
-                "[b cyan]┌─────────────────────────────────────────┐[/]\n"
-                "[b cyan]│[/]    [b white]DB Tunnel Manager[/]                   [b cyan]│[/]\n"
-                "[b cyan]│[/]    [dim]Select databases to connect[/]        [b cyan]│[/]\n"
-                "[b cyan]└─────────────────────────────────────────┘[/]",
+                "[b white] D B   T U N N E L   M A N A G E R [/]",
                 id="sel-header", markup=True,
             )
             yield Static("", id="sel-list", markup=True)
@@ -658,18 +694,26 @@ if HAS_TEXTUAL:
 
         def _refresh_list(self) -> None:
             lines = []
-            lines.append("  [dim]Press number key to toggle selection:[/]")
+            lines.append("  [dim]Press number key (1-9,0) or ↑↓+space to toggle:[/]")
             lines.append("")
             for idx, svc in enumerate(SERVICES):
                 num = idx + 1
+                # Display key: 1-9 for first 9, 0 for 10th, · for 11+
+                if num <= 9:
+                    key_label = str(num)
+                elif num == 10:
+                    key_label = "0"
+                else:
+                    key_label = "·"
+                cursor = "▸" if idx == self._cursor else " "
                 if svc.name in self._selected:
                     lines.append(
-                        f"    [b white on green] {num} [/]  [green]☑[/] [b]{svc.name:<14}[/]"
+                        f"  {cursor} [b white on green] {key_label} [/]  [green]☑[/] [b]{svc.name:<18}[/]"
                         f"  [dim](localhost:{svc.local_port})[/]"
                     )
                 else:
                     lines.append(
-                        f"    [b white on #333333] {num} [/]  [dim]☐[/] {svc.name:<14}"
+                        f"  {cursor} [b white on #333333] {key_label} [/]  [dim]☐[/] {svc.name:<18}"
                         f"  [dim](localhost:{svc.local_port})[/]"
                     )
             lines.append("")
@@ -682,6 +726,8 @@ if HAS_TEXTUAL:
             else:
                 lines.append("  [dim]Select at least one database, then press [b]f[/] to forward or [b]c[/] for psql[/]")
             lines.append("")
+            if len(SERVICES) > 10:
+                lines.append("  [dim]Use ↑↓ arrows + space for services beyond 10[/]")
             lines.append("  [dim]Ctrl+Q to quit[/]")
             self.query_one("#sel-list", Static).update("\n".join(lines))
 
@@ -700,6 +746,32 @@ if HAS_TEXTUAL:
         def action_toggle_3(self) -> None: self._toggle(2)
         def action_toggle_4(self) -> None: self._toggle(3)
         def action_toggle_5(self) -> None: self._toggle(4)
+        def action_toggle_6(self) -> None: self._toggle(5)
+        def action_toggle_7(self) -> None: self._toggle(6)
+        def action_toggle_8(self) -> None: self._toggle(7)
+        def action_toggle_9(self) -> None: self._toggle(8)
+        def action_toggle_0(self) -> None: self._toggle(9)
+
+        def action_cursor_up(self) -> None:
+            if self._cursor > 0:
+                self._cursor -= 1
+                self._refresh_list()
+
+        def action_cursor_down(self) -> None:
+            if self._cursor < len(SERVICES) - 1:
+                self._cursor += 1
+                self._refresh_list()
+
+        def action_toggle_cursor(self) -> None:
+            self._toggle(self._cursor)
+
+        def action_select_all(self) -> None:
+            self._selected = {s.name for s in SERVICES}
+            self._refresh_list()
+
+        def action_select_none(self) -> None:
+            self._selected.clear()
+            self._refresh_list()
 
         def action_forward(self) -> None:
             if not self._selected:
@@ -725,21 +797,16 @@ if HAS_TEXTUAL:
         CSS = """
         #header-box {
             height: auto;
-            padding: 1 3;
+            padding: 1 2;
             background: $boost;
             margin-bottom: 1;
+            width: 100%;
+            border: round cyan;
+            text-style: bold;
         }
         #step-area {
             height: auto;
             padding: 0 3;
-        }
-        #actions {
-            height: auto;
-            padding: 1 3;
-            dock: bottom;
-        }
-        #actions Button {
-            margin: 0 2 0 0;
         }
         #progress-log {
             height: 1fr;
@@ -750,11 +817,9 @@ if HAS_TEXTUAL:
         """
 
         BINDINGS = [
-            Binding("1", "toggle_1", show=False, priority=True),
-            Binding("2", "toggle_2", show=False, priority=True),
-            Binding("3", "toggle_3", show=False, priority=True),
-            Binding("4", "toggle_4", show=False, priority=True),
-            Binding("5", "toggle_5", show=False, priority=True),
+            Binding("up", "cursor_up", show=False, priority=True),
+            Binding("down", "cursor_down", show=False, priority=True),
+            Binding("space", "toggle_cursor", "Toggle (space)", show=True, priority=True),
             Binding("enter", "do_connect", "Connect", show=True, priority=True),
             Binding("ctrl+q", "quit_app", "Quit (^Q)", show=True),
         ]
@@ -764,61 +829,76 @@ if HAS_TEXTUAL:
             self.services = services
             self._service_infos: list[tuple] = []
             self._endpoint_choices: dict[str, str] = {}
+            self._cursor: int = 0
             self._ready = False
+            self._log_lines: list[str] = []
 
         def compose(self) -> ComposeResult:
             yield Header(show_clock=True)
             yield Static(
-                "[b cyan]┌─────────────────────────────────────────┐[/]\n"
-                "[b cyan]│[/]    [b white]DB Tunnel Manager[/]                   [b cyan]│[/]\n"
-                "[b cyan]│[/]    [dim]PostgreSQL tunnel management tool[/]   [b cyan]│[/]\n"
-                "[b cyan]└─────────────────────────────────────────┘[/]",
+                "[b white] D B   T U N N E L   M A N A G E R [/]",
                 id="header-box", markup=True,
             )
-            yield Static("[dim]Connecting to cluster...[/dim]", id="step-area", markup=True)
+            yield RichLog(id="step-area", highlight=True, markup=True, auto_scroll=False)
             yield Rule()
-            with Horizontal(id="actions"):
-                yield Button("▶ Connect", id="btn-connect", variant="success", disabled=True)
-                yield Button("✕ Quit", id="btn-quit", variant="error")
             yield RichLog(id="progress-log", highlight=True, markup=True)
             yield Footer()
 
         def on_mount(self) -> None:
+            self.query_one("#step-area", RichLog).write("[dim]Connecting to cluster...[/]")
             self._load_cluster_info()
+
+        def _write_log(self, msg: str) -> None:
+            """Write to progress log and keep a copy for ManageScreen."""
+            self._log_lines.append(msg)
+            self.query_one("#progress-log", RichLog).write(msg)
 
         @work(thread=True)
         def _load_cluster_info(self) -> None:
-            log = self.query_one("#progress-log", RichLog)
 
             try:
                 ctx = kubectl("config", "current-context").stdout.strip()
             except Exception:
-                log.write("[red bold]✖ ERROR:[/] No kubectl context set!")
+                self.app.call_from_thread(self._write_log, "[red bold]✖ ERROR:[/] No kubectl context set!")
                 return
 
-            log.write(f"[green]✔[/] Connected to cluster: [b]{ctx}[/]")
+            self._cluster_ctx = ctx
+            # Update header with cluster context
+            if "prod" in ctx.lower():
+                hdr_text = f"[b white] D B   T U N N E L   M A N A G E R [/]  ⚠  [b red]{ctx}[/]"
+            else:
+                hdr_text = f"[b white] D B   T U N N E L   M A N A G E R [/]  ✔ [b cyan]{ctx}[/]"
+            self.app.call_from_thread(self.query_one("#header-box", Static).update, hdr_text)
+            self.app.call_from_thread(self._write_log, f"[green]✔[/] Connected to cluster: [b]{ctx}[/]")
 
             infos = []
             for svc_name in self.services:
                 svc = SERVICE_MAP.get(svc_name)
                 if not svc:
-                    log.write(f"[red]✖[/] Unknown service: {svc_name}")
-                    return
+                    self.app.call_from_thread(self._write_log, f"[red]✖[/] Unknown service: {svc_name} — skipping")
+                    continue
 
-                log.write(f"[cyan]⟳[/] Fetching credentials for [b]{svc.name}[/]...")
+                self.app.call_from_thread(self._write_log, f"[cyan]⟳[/] Fetching credentials for [b]{svc.name}[/]...")
                 try:
                     decoded = decode_secret(svc.secret, svc.namespace)
                 except Exception:
-                    log.write(f"[red]✖[/] Failed to get secret for {svc.name}")
-                    return
+                    self.app.call_from_thread(self._write_log, f"[red]✖[/] Failed to get secret for {svc.name} — skipping")
+                    continue
 
                 info = resolve_connection(decoded)
                 infos.append((svc, info))
-                log.write(f"  [green]✔[/] Ready")
+                self.app.call_from_thread(self._write_log, f"  [green]✔[/] Ready")
 
             self._service_infos = infos
-            log.write("")
-            log.write("[green bold]All secrets loaded.[/] Configure endpoints below ↑")
+            if not infos:
+                self.app.call_from_thread(self._write_log, "")
+                self.app.call_from_thread(self._write_log, "[red bold]✖ No services loaded. Check secrets and try again.[/]")
+                return
+            self.app.call_from_thread(self._write_log, "")
+            skipped = len(self.services) - len(infos)
+            if skipped:
+                self.app.call_from_thread(self._write_log, f"[yellow]⚠ {skipped} service(s) skipped due to errors[/]")
+            self.app.call_from_thread(self._write_log, "[green bold]Secrets loaded.[/] Configure endpoints below ↑")
 
             self.app.call_from_thread(self._render_ui, ctx)
 
@@ -832,7 +912,6 @@ if HAS_TEXTUAL:
                     self._endpoint_choices[svc.name] = "single"
 
             self._refresh_step_area(ctx)
-            self.query_one("#btn-connect", Button).disabled = False
             self._ready = True
 
         def _refresh_step_area(self, ctx: str = "") -> None:
@@ -850,31 +929,33 @@ if HAS_TEXTUAL:
             lines.append("")
             # Section 2: Endpoints
             lines.append("[b]STEP 2[/] │ Choose Endpoint")
-            lines.append("         [dim]Press the number key (e.g. [b]1[/]) to switch between RO ↔ RW[/]")
+            lines.append("         [dim]Use ↑↓ arrows + space to switch RO ↔ RW[/]")
             lines.append("")
 
             for idx, (svc, info) in enumerate(self._service_infos):
-                num = idx + 1
+                cursor = "▸" if idx == self._cursor else " "
                 if info.ro_host and info.ro_host != info.host:
                     choice = self._endpoint_choices.get(svc.name, "ro")
                     if choice == "ro":
-                        lines.append(f"    [b white on green] {num} [/]  [b]{svc.name}[/]  [dim]← press {num} to switch[/]")
-                        lines.append(f"         [green]◉ READ-ONLY[/]   {info.ro_host}")
-                        lines.append(f"         [dim]◯ READ-WRITE  {info.host}[/]")
+                        lines.append(f"  {cursor} [b white on green]   [/]  [b]{svc.name}[/]")
+                        lines.append(f"         [green]◉ READ-ONLY[/]   {info.ro_host}:{info.port}")
+                        lines.append(f"         [dim]◯ READ-WRITE  {info.host}:{info.port}[/]")
                     else:
-                        lines.append(f"    [b white on yellow] {num} [/]  [b]{svc.name}[/]  [dim]← press {num} to switch[/]")
-                        lines.append(f"         [dim]◯ READ-ONLY   {info.ro_host}[/]")
-                        lines.append(f"         [yellow]◉ READ-WRITE[/]  {info.host}")
+                        lines.append(f"  {cursor} [b white on yellow]   [/]  [b]{svc.name}[/]")
+                        lines.append(f"         [dim]◯ READ-ONLY   {info.ro_host}:{info.port}[/]")
+                        lines.append(f"         [yellow]◉ READ-WRITE[/]  {info.host}:{info.port}")
                 else:
-                    lines.append(f"    [b white on blue] {num} [/]  [b]{svc.name}[/]")
-                    lines.append(f"         [blue]◉ SINGLE[/]      {info.host}")
+                    lines.append(f"  {cursor} [b white on blue]   [/]  [b]{svc.name}[/]")
+                    lines.append(f"         [blue]◉ SINGLE[/]      {info.host}:{info.port}")
                 lines.append("")
 
             # Section 3: Action
             lines.append("[b]STEP 3[/] │ Press [b green]Enter[/] or click [b green]▶ Connect[/] to start tunnels")
 
-            step_area = self.query_one("#step-area", Static)
-            step_area.update("\n".join(lines))
+            step_area = self.query_one("#step-area", RichLog)
+            step_area.clear()
+            for line in lines:
+                step_area.write(line)
 
         def _toggle_endpoint(self, idx: int) -> None:
             if not self._ready or idx >= len(self._service_infos):
@@ -886,33 +967,33 @@ if HAS_TEXTUAL:
             self._endpoint_choices[svc.name] = "rw" if current == "ro" else "ro"
             self._refresh_step_area()
 
-        def action_toggle_1(self) -> None: self._toggle_endpoint(0)
-        def action_toggle_2(self) -> None: self._toggle_endpoint(1)
-        def action_toggle_3(self) -> None: self._toggle_endpoint(2)
-        def action_toggle_4(self) -> None: self._toggle_endpoint(3)
-        def action_toggle_5(self) -> None: self._toggle_endpoint(4)
+        def action_cursor_up(self) -> None:
+            if self._cursor > 0:
+                self._cursor -= 1
+                self._refresh_step_area()
+
+        def action_cursor_down(self) -> None:
+            if self._cursor < len(self._service_infos) - 1:
+                self._cursor += 1
+                self._refresh_step_area()
+
+        def action_toggle_cursor(self) -> None:
+            self._toggle_endpoint(self._cursor)
 
         def action_do_connect(self) -> None:
-            btn = self.query_one("#btn-connect", Button)
-            if not btn.disabled and self._ready:
-                btn.disabled = True
+            if self._ready:
+                self._ready = False
                 self._do_connect()
 
         def on_button_pressed(self, event: Button.Pressed) -> None:
-            if event.button.id == "btn-quit":
-                self.app.exit()
-            elif event.button.id == "btn-connect":
-                if self._ready:
-                    event.button.disabled = True
-                    self._do_connect()
+            pass
 
         @work(thread=True)
         def _do_connect(self) -> None:
-            log = self.query_one("#progress-log", RichLog)
             tunnels = []
 
-            log.write("")
-            log.write("[b]━━━ Connecting ━━━[/]")
+            self.app.call_from_thread(self._write_log, "")
+            self.app.call_from_thread(self._write_log, "[b]━━━ Connecting ━━━[/]")
 
             for svc, info in self._service_infos:
                 choice = self._endpoint_choices.get(svc.name, "ro")
@@ -925,32 +1006,39 @@ if HAS_TEXTUAL:
                         info.password = parsed.password or info.password
                         info.dbname = parsed.dbname or info.dbname
                         info.port = parsed.port or info.port
-                    log.write(f"  [green]{svc.name}[/] → RO endpoint")
+                    self.app.call_from_thread(self._write_log, f"  [green]{svc.name}[/] → RO endpoint")
                 elif choice == "rw":
-                    log.write(f"  [yellow]{svc.name}[/] → RW endpoint")
+                    self.app.call_from_thread(self._write_log, f"  [yellow]{svc.name}[/] → RW endpoint")
                 else:
-                    log.write(f"  [blue]{svc.name}[/] → single endpoint")
+                    self.app.call_from_thread(self._write_log, f"  [blue]{svc.name}[/] → single endpoint")
                 tunnels.append(Tunnel(svc=svc, info=info))
 
-            log.write("")
-            log.write("[cyan]⟳[/] Preparing relay pod...")
+            self.app.call_from_thread(self._write_log, "")
+            self.app.call_from_thread(self._write_log, f"[cyan]⟳[/] Preparing relay pod [b]{POD_NAME}[/] (ns: [b]{POD_NS}[/])...")
             ensure_pod()
             install_socat()
-            log.write("[green]✔[/] Pod ready")
+            self.app.call_from_thread(self._write_log, f"[green]✔[/] Pod [b]{POD_NAME}[/] ready")
 
             for i, t in enumerate(tunnels):
-                log.write(f"[cyan]⟳[/] {t.svc.name} → localhost:{t.svc.local_port}...")
+                self.app.call_from_thread(self._write_log,
+                    f"[bold cyan]⟳[/] [bold white]{t.svc.name}[/] → [bold green]localhost:{t.svc.local_port}[/]")
+                self.app.call_from_thread(self._write_log,
+                    f"   [bold orange1]socat[/] [bold white]:{t.svc.relay_port}[/] → [bold green]{t.info.host}:{t.info.port}[/]")
+                self.app.call_from_thread(self._write_log,
+                    f"   [orange1]db[/]=[bold white]{t.info.dbname}[/]  [orange1]user[/]=[bold white]{t.info.user}[/]  [orange1]ns[/]=[bold white]{t.svc.namespace}[/]  [orange1]secret[/]=[bold white]{t.svc.secret}[/]")
                 start_tunnel(t, i)
                 if t.status == "connected":
-                    log.write(f"  [green]✔[/] Tunnel active")
+                    self.app.call_from_thread(self._write_log, f"  [green]✔[/] Tunnel active")
                 else:
-                    log.write(f"  [red]✖[/] Failed to start!")
+                    self.app.call_from_thread(self._write_log, f"  [red]✖[/] Failed to start!")
 
-            log.write("")
-            log.write("[green bold]✔ All tunnels ready![/]")
+            self.app.call_from_thread(self._write_log, "")
+            self.app.call_from_thread(self._write_log, "[green bold]✔ All tunnels ready![/]")
             time.sleep(1)
 
             self.app._pending_tunnels = tunnels
+            self.app._setup_log_lines = list(self._log_lines)
+            self.app._cluster_ctx = getattr(self, '_cluster_ctx', '')
             self.app.call_from_thread(self.app._show_manage_screen)
 
         def action_quit_app(self) -> None:
@@ -963,22 +1051,26 @@ if HAS_TEXTUAL:
         CSS = """
         #mgmt-header {
             height: auto;
-            padding: 0 3;
-            margin: 1 0;
+            max-height: 50%;
+            padding: 1 1;
+            margin: 0;
+            width: 100%;
+            border: round cyan;
         }
         #mgmt-table {
             height: auto;
-            max-height: 45%;
-            margin: 0 3;
+            max-height: 40%;
+            margin: 0;
         }
         #hint-bar {
             height: auto;
-            padding: 0 3;
+            padding: 0 1;
             margin: 1 0 0 0;
         }
         #mgmt-log {
             height: 1fr;
-            margin: 0 3 1 3;
+            min-height: 10;
+            margin: 0 0 1 0;
             border: round $accent;
             padding: 0 1;
         }
@@ -992,6 +1084,7 @@ if HAS_TEXTUAL:
             Binding("p", "copy_port", "Copy Port", show=True),
             Binding("u", "copy_user", "Copy User", show=True),
             Binding("b", "copy_db", "Copy DB", show=True),
+            Binding("a", "copy_all", "Copy All", show=True),
             Binding("ctrl+q", "quit_all", "Quit All (^Q)", show=True),
             Binding("1", "sel_1", show=False),
             Binding("2", "sel_2", show=False),
@@ -1000,13 +1093,16 @@ if HAS_TEXTUAL:
             Binding("5", "sel_5", show=False),
         ]
 
-        def __init__(self, tunnels: list, **kwargs):
+        def __init__(self, tunnels: list, prior_logs: list[str] | None = None,
+                     cluster_ctx: str = "", **kwargs):
             super().__init__(**kwargs)
             self.tunnels = tunnels
+            self._prior_logs = prior_logs or []
+            self._cluster_ctx = cluster_ctx
 
         def compose(self) -> ComposeResult:
             yield Header(show_clock=True)
-            yield Static(self._header_text(), id="mgmt-header", markup=True)
+            yield RichLog(id="mgmt-header", highlight=True, markup=True, auto_scroll=False)
             yield DataTable(id="mgmt-table")
             yield Static(
                 "[dim]Keys:[/] [b]↑↓[/] select  │  "
@@ -1023,7 +1119,18 @@ if HAS_TEXTUAL:
             table.cursor_type = "row"
             self._refresh_table()
             self.set_interval(5, self._auto_check)
-            self._log("[green]✔[/] Tunnel manager active. Use keys above to manage.")
+            # Populate header with connection details
+            hdr = self.query_one("#mgmt-header", RichLog)
+            for line in self._header_text().splitlines():
+                hdr.write(line)
+            # Replay setup logs
+            log = self.query_one("#mgmt-log", RichLog)
+            for line in self._prior_logs:
+                log.write(line)
+            if self._prior_logs:
+                log.write("")
+                log.write("[dim]─── Manage Screen ───[/]")
+            log.write("[green]✔[/] Tunnel manager active. Use keys above to manage.")
 
         def _refresh_table(self) -> None:
             table = self.query_one("#mgmt-table", DataTable)
@@ -1045,18 +1152,25 @@ if HAS_TEXTUAL:
 
         def _header_text(self) -> str:
             user = os.environ.get("USER", "user")
+            ctx = self._cluster_ctx
+            if "prod" in ctx.lower():
+                cluster_line = f"  [b red]\u26a0  PRODUCTION[/]  [b red]{ctx}[/]"
+            else:
+                cluster_line = f"  [green]\u2714[/] Cluster: [b]{ctx}[/]"
             lines = [
-                "[b]pgAdmin Connection Details[/]  [dim](select text to copy)[/]",
+                "[b]pgAdmin Connection Details[/]  [dim](press [b]a[/] to copy all)[/]",
+                cluster_line,
                 "",
             ]
             for t in self.tunnels:
-                lines.append(f"  [b cyan]── {t.svc.name} ──[/]")
-                lines.append(f"    Host:       [green]localhost[/]")
-                lines.append(f"    Port:       [green]{t.svc.local_port}[/]")
+                ep_type = "RO" if t.info.host == getattr(t.info, 'ro_host', '') else "RW"
+                lines.append(f"  [b cyan]── {t.svc.name} ──[/]  [dim]({ep_type})[/]")
+                lines.append(f"    Host:       [green]localhost:{t.svc.local_port}[/]")
                 lines.append(f"    Database:   [green]{t.info.dbname}[/]")
                 lines.append(f"    Username:   [green]{t.info.user}[/]  [yellow]← update in pgAdmin if this changes[/]")
                 lines.append(f"    Password:   [yellow]leave empty[/] — auto-read from ~/.pgpass")
                 lines.append(f"    Passfile:   [dim]/Users/{user}/.pgpass[/]")
+                lines.append(f"    Remote:     [dim]{t.info.host}:{t.info.port}[/]")
                 lines.append("")
             return "\n".join(lines)
 
@@ -1163,26 +1277,16 @@ if HAS_TEXTUAL:
                     # Check port-forward stderr log for errors
                     pf_errors = check_pf_errors(t)
                     if pf_errors:
-                        # Classify: critical errors vs transient ones
-                        critical_pats = ["connection reset by peer", "connection refused",
-                                         "lost connection to pod", "EOF"]
-                        is_critical = any(
-                            any(p in e.lower() for p in critical_pats)
-                            for e in pf_errors
-                        )
-                        self._log(f"[yellow]⚠ {t.svc.name} port-forward errors:[/]")
+                        self._log(f"[red bold]⚠ {t.svc.name} connection errors detected:[/]")
                         for err in pf_errors[-3:]:
                             self._log(f"  [dim]{err}[/]")
-                        if is_critical:
-                            self._log(
-                                f"[yellow bold]  → Check pgAdmin config for {t.svc.name}![/]"
-                                f"\n[yellow]    If credentials rotated: update Username to "
-                                f"[b]{t.info.user}[/] and reconnect.[/]"
-                                f"\n[yellow]    Press [b]u[/] to copy username, "
-                                f"[b]r[/] to reconnect tunnel.[/]"
-                            )
-                        else:
-                            self._log("[dim]  Transient errors — tunnel still active. Monitor for recurrence.[/]")
+                        self._log(
+                            f"[yellow bold]  → Check pgAdmin config for {t.svc.name}![/]"
+                            f"\n[yellow]    If credentials rotated: update Username to "
+                            f"[b]{t.info.user}[/] and reconnect.[/]"
+                            f"\n[yellow]    Press [b]u[/] to copy username, "
+                            f"[b]r[/] to reconnect tunnel.[/]"
+                        )
                         # Clear log after reporting to avoid repeat alerts
                         try:
                             open(t.pf_log, "w").close()
@@ -1217,6 +1321,28 @@ if HAS_TEXTUAL:
             idx = self._get_idx()
             if idx < len(self.tunnels):
                 self._copy_to_clipboard(self.tunnels[idx].info.dbname, "Database")
+
+        def action_copy_all(self) -> None:
+            """Copy all connection details as plain text to clipboard."""
+            user = os.environ.get("USER", "user")
+            ctx = self._cluster_ctx
+            lines = [f"Cluster: {ctx}", ""]
+            for t in self.tunnels:
+                ep_type = "RO" if t.info.host == getattr(t.info, 'ro_host', '') else "RW"
+                lines.append(f"── {t.svc.name} ({ep_type}) ──")
+                lines.append(f"  Host:       localhost:{t.svc.local_port}")
+                lines.append(f"  Database:   {t.info.dbname}")
+                lines.append(f"  Username:   {t.info.user}")
+                lines.append(f"  Password:   (leave empty — auto-read from ~/.pgpass)")
+                lines.append(f"  Passfile:   /Users/{user}/.pgpass")
+                lines.append(f"  Remote:     {t.info.host}:{t.info.port}")
+                lines.append("")
+            text = "\n".join(lines)
+            try:
+                subprocess.run(["pbcopy"], input=text.encode(), check=True)
+                self._log("[green]✔[/] All connection details copied to clipboard")
+            except Exception:
+                self._log("[yellow]⚠[/] Copy failed")
 
         @work(thread=True)
         def action_quit_all(self) -> None:
@@ -1260,7 +1386,11 @@ if HAS_TEXTUAL:
             self._psql_service: str | None = None
 
         def _show_manage_screen(self) -> None:
-            self.push_screen(ManageScreen(self._pending_tunnels))
+            self.push_screen(ManageScreen(
+                self._pending_tunnels,
+                prior_logs=getattr(self, '_setup_log_lines', []),
+                cluster_ctx=getattr(self, '_cluster_ctx', ''),
+            ))
 
         def on_mount(self) -> None:
             if self.services:
@@ -1441,15 +1571,15 @@ def multi_forward(selected: list[str]) -> None:
     for svc_name in selected:
         svc = SERVICE_MAP.get(svc_name)
         if not svc:
-            print(f"{ERR} Unknown service: {RED}{svc_name}{NC}")
-            sys.exit(1)
+            print(f"{ERR} Unknown service: {RED}{svc_name}{NC} — skipping")
+            continue
 
         print(f"\n{INFO} [{GREEN}{svc.name}{NC}] Fetching secret {CYAN}{svc.secret}{NC} (ns: {CYAN}{svc.namespace}{NC})...")
         try:
             decoded = decode_secret(svc.secret, svc.namespace)
         except subprocess.CalledProcessError:
-            print(f"{ERR} [{svc.name}] Failed to retrieve secret.")
-            sys.exit(1)
+            print(f"{ERR} [{svc.name}] Failed to retrieve secret — skipping")
+            continue
 
         info = resolve_connection(decoded)
         info = prompt_ro_rw(info, svc_name=svc.name, indent="  ")
@@ -1584,7 +1714,6 @@ def main() -> None:
         return
 
     # ── Confirm kubectl context ────────────────────────────────────
-    _install_signal_handlers()  # Safe for non-TUI mode only
     try:
         ctx = kubectl("config", "current-context").stdout.strip()
     except subprocess.CalledProcessError:
