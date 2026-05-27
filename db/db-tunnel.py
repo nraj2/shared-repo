@@ -51,7 +51,8 @@ except ImportError:
 
 
 def _ensure_textual() -> bool:
-    """Prompt to install textual if missing. Returns True if available."""
+    """Prompt to install textual if missing. Returns True if available.
+    Re-execs the script after install so TUI classes get defined."""
     global HAS_TEXTUAL
     if HAS_TEXTUAL:
         return True
@@ -65,24 +66,12 @@ def _ensure_textual() -> bool:
     try:
         subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "textual"])
     except subprocess.CalledProcessError:
-        print(f"{ERR} Failed to install textual.")
+        print(f"Failed to install textual. Use --no-tui for text mode.")
         return False
-    # Re-import after install
-    from textual.app import App, ComposeResult
-    from textual.widgets import DataTable, Footer, Header, Static, RichLog
-    from textual.binding import Binding
-    from textual.containers import Vertical, Horizontal
-    from textual.reactive import reactive
-    from textual import work
-    # Inject into module globals so TUI classes can use them
-    for name, obj in [("App", App), ("ComposeResult", ComposeResult),
-                      ("DataTable", DataTable), ("Footer", Footer),
-                      ("Header", Header), ("Static", Static), ("RichLog", RichLog),
-                      ("Binding", Binding), ("Vertical", Vertical),
-                      ("Horizontal", Horizontal), ("reactive", reactive), ("work", work)]:
-        globals()[name] = obj
-    HAS_TEXTUAL = True
-    return True
+    # Re-exec so the 'if HAS_TEXTUAL:' block defines all TUI classes
+    print("Restarting with textual...")
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+    return False  # unreachable
 
 # ── Colours / symbols ──────────────────────────────────────────────
 RED = "\033[0;31m"
@@ -1549,7 +1538,7 @@ def main() -> None:
 
     # ── No services: launch TUI picker or error ───────────────────
     if not args.services:
-        if HAS_TEXTUAL and not args.no_tui:
+        if not args.no_tui and _ensure_textual():
             app = TunnelManagerApp()
             app.run()
             # Check if user chose psql console from TUI
@@ -1576,7 +1565,7 @@ def main() -> None:
         sys.exit(1)
 
     # ── TUI mode: launch full UI for --forward when textual is available ──
-    if args.forward and HAS_TEXTUAL and not args.no_tui:
+    if args.forward and not args.no_tui and _ensure_textual():
         # Validate services exist
         for s in args.services:
             if s not in SERVICE_MAP:
