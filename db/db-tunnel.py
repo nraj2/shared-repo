@@ -110,7 +110,7 @@ class ServiceDef:
 SERVICES: list[ServiceDef] = [
     ServiceDef("ipam",       "ipam-db-dsn",         "ddi", 15435, 5554),
     ServiceDef("dispatcher", "dispatcher-db-dsn",   "ddi", 15434, 5553),
-    ServiceDef("scheduler-dbclaim",  "scheduler-dbclaim", "atlas-jobs",  15437, 5556),
+    ServiceDef("scheduler",  "scheduler-dbclaim", "atlas-jobs",  15437, 5556),
     ServiceDef("ricketts",  "ddi-dns-ricketts-db-dsn", "ricketts",  15436, 5555),
     ServiceDef("dns-conf",   "dns-config-db-dsn",  "ddi", 15433, 5552),
     ServiceDef("dns-data",   "dns-data-db-dsn",    "ddi", 15432, 5551),
