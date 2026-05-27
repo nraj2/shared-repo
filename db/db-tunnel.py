@@ -37,6 +37,7 @@ from typing import Optional
 from urllib.parse import unquote
 
 # Try importing textual for TUI mode
+HAS_TEXTUAL = False
 try:
     from textual.app import App, ComposeResult
     from textual.widgets import DataTable, Footer, Header, Static, RichLog
@@ -46,20 +47,42 @@ try:
     from textual import work
     HAS_TEXTUAL = True
 except ImportError:
-    HAS_TEXTUAL = False
-    # Auto-install textual if missing
-    _ans = input("textual is not installed (needed for TUI mode). Install now? [Y/n] ").strip()
-    if _ans.lower() != "n":
-        import subprocess as _sp
-        print("Installing textual...")
-        _sp.check_call([sys.executable, "-m", "pip", "install", "--quiet", "textual"])
-        from textual.app import App, ComposeResult
-        from textual.widgets import DataTable, Footer, Header, Static, RichLog
-        from textual.binding import Binding
-        from textual.containers import Vertical, Horizontal
-        from textual.reactive import reactive
-        from textual import work
-        HAS_TEXTUAL = True
+    pass
+
+
+def _ensure_textual() -> bool:
+    """Prompt to install textual if missing. Returns True if available."""
+    global HAS_TEXTUAL
+    if HAS_TEXTUAL:
+        return True
+    try:
+        ans = input("textual is not installed (needed for TUI mode). Install now? [Y/n] ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return False
+    if ans.lower() == "n":
+        return False
+    print("Installing textual...")
+    try:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "textual"])
+    except subprocess.CalledProcessError:
+        print(f"{ERR} Failed to install textual.")
+        return False
+    # Re-import after install
+    from textual.app import App, ComposeResult
+    from textual.widgets import DataTable, Footer, Header, Static, RichLog
+    from textual.binding import Binding
+    from textual.containers import Vertical, Horizontal
+    from textual.reactive import reactive
+    from textual import work
+    # Inject into module globals so TUI classes can use them
+    for name, obj in [("App", App), ("ComposeResult", ComposeResult),
+                      ("DataTable", DataTable), ("Footer", Footer),
+                      ("Header", Header), ("Static", Static), ("RichLog", RichLog),
+                      ("Binding", Binding), ("Vertical", Vertical),
+                      ("Horizontal", Horizontal), ("reactive", reactive), ("work", work)]:
+        globals()[name] = obj
+    HAS_TEXTUAL = True
+    return True
 
 # ── Colours / symbols ──────────────────────────────────────────────
 RED = "\033[0;31m"
