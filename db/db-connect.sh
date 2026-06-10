@@ -17,6 +17,7 @@ SERVICES=(
   "dispatcher|dispatcher-db-dsn|ddi|15434|5553"
   "ipam|ipam-db-dsn|ddi|15435|5554"
   "scheduler|scheduler-dbclaim|atlas-jobs|15437|5556"
+  "scheduler-us-stg|atlas-jobs-scheduler-api-postgresql-config|atlas-jobs|15438|5557"
   "ricketts|ddi-dns-ricketts-db-dsn|ricketts|15436|5555"
   # "another-svc|another-svc-db-dsn|another-ns|15436|5555"
 )
@@ -34,7 +35,7 @@ FORWARD_RELAY_PORT=""   # set by forward(), used by cleanup
 # Cleanup only if this script run created the pod; kill only this service's socat relay.
 cleanup() {
   # Stop all managed tunnels if multi-service mode
-  if [[ ${#SVC_PF_PIDS[@]:-0} -gt 0 ]]; then
+  if [[ ${#SVC_PF_PIDS[@]} -gt 0 ]]; then
     for i in "${!SVC_PF_PIDS[@]}"; do
       [[ -n "${SVC_PF_PIDS[$i]:-}" ]] && kill "${SVC_PF_PIDS[$i]}" 2>/dev/null || true
     done
