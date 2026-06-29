@@ -180,7 +180,7 @@ def parse_uri_dsn(dsn: str) -> ConnInfo:
     info = ConnInfo(raw_dsn=dsn)
     m = re.match(r"postgres(?:ql)?://([^:]*):([^@]*)@([^:/]+)(?::(\d+))?/([^?]*)", dsn)
     if m:
-        info.user, info.password, info.host = m.group(1), m.group(2), m.group(3)
+        info.user, info.password, info.host = unquote(m.group(1)), unquote(m.group(2)), m.group(3)
         info.port = m.group(4) or "5432"
         info.dbname = m.group(5)
     return info
@@ -294,9 +294,8 @@ def prompt_missing(info: ConnInfo) -> ConnInfo:
 def write_pgpass(local_port: int, dbname: str, password: str) -> None:
     """Write or update ~/.pgpass entry for the given port. Cleans stale entries by port."""
     pgpass = Path.home() / ".pgpass"
-    raw_pass = unquote(password)
     # Escape \ and : as required by pgpass format
-    escaped = raw_pass.replace("\\", "\\\\").replace(":", "\\:")
+    escaped = password.replace("\\", "\\\\").replace(":", "\\:")
     entry = f"localhost:{local_port}:{dbname}:*:{escaped}"
 
     lines: list[str] = []
@@ -505,9 +504,8 @@ def check_tunnel_health(t: Tunnel, idx: int) -> bool:
             return False
 
     # 2. Active probe: test PostgreSQL connectivity through the socat relay
-    raw_pass = unquote(t.info.password)
     # Base64-encode password to pass safely through shell
-    pass_b64 = base64.b64encode(raw_pass.encode()).decode()
+    pass_b64 = base64.b64encode(t.info.password.encode()).decode()
     try:
         probe = kubectl_exec(
             f"PGPASSWORD=$(echo '{pass_b64}' | base64 -d) "

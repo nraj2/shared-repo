@@ -191,6 +191,9 @@ parse_uri_dsn() {
   db_port=$(echo "$dsn" | sed -n 's|.*@[^:]*:\([0-9]*\)/.*|\1|p')
   db_port="${db_port:-5432}"
   db_name=$(echo "$dsn" | sed -n 's|.*/\([^?]*\).*|\1|p')
+  # URL-decode user and password (URI-style DSNs percent-encode special chars)
+  db_user=$(printf '%s' "$db_user" | python3 -c "import sys,urllib.parse; print(urllib.parse.unquote(sys.stdin.read()),end='')")
+  db_pass=$(printf '%s' "$db_pass" | python3 -c "import sys,urllib.parse; print(urllib.parse.unquote(sys.stdin.read()),end='')")
 }
 
 # Parse a libpq key=value DSN: host=... port=... user=... password=... dbname=...
@@ -408,9 +411,7 @@ forward() {
     return 1
   }
 
-  # URL-decode the password (%2B → +, %40 → @, etc.)
-  local raw_pass
-  raw_pass=$(printf '%s' "$db_pass" | python3 -c "import sys,urllib.parse; print(urllib.parse.unquote(sys.stdin.read()),end='')")
+  local raw_pass="$db_pass"
 
   local svc_name="${SERVICE}"   # e.g. "ipam" — used as the pg_service name
 
@@ -482,9 +483,7 @@ start_tunnel() {
     "nohup socat TCP-LISTEN:${rport},fork,reuseaddr TCP:${host}:${port} >/dev/null 2>&1 &" 2>/dev/null
   sleep 1
 
-  # URL-decode the password
-  local raw_pass
-  raw_pass=$(printf '%s' "$pass" | python3 -c "import sys,urllib.parse; print(urllib.parse.unquote(sys.stdin.read()),end='')")
+  local raw_pass="$pass"
 
   # Write ~/.pgpass entry
   local pgpass="$HOME/.pgpass"
